@@ -1,234 +1,390 @@
-import os
+"""
+Обучение модели классификации состояния растений.
+EfficientNet-B0 с transfer learning на PlantVillage.
+
+Запуск:
+    python train.py --data_dir data/PlantVillage --epochs 20 --batch_size 32
+"""
+
 import argparse
-import numpy as np
+import json
+import os
+import random
+import time
+
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms, models
-from torchvision.datasets import ImageFolder
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+from tqdm import tqdm
 
-# Константы
-DEFAULT_DATA_DIR = './data/plantvillage'  # путь к данным (структура: class/subfolder/images)
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_EPOCHS = 10
-DEFAULT_LR = 0.001
-DEFAULT_NUM_CLASSES = 2  # бинарная классификация (здоровое/больное) – измените при необходимости
-DEFAULT_IMG_SIZE = 224
 
-def get_transform(img_size, is_train=True):
-    """Трансформации для изображений: ресайз, аугментация (для train), нормализация."""
-    if is_train:
-        transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+# ========================== ВОСПРОИЗВОДИМОСТЬ ==========================
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_device():
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Apple MPS")
+    else:
+        device = torch.device("cpu")
+        print("CPU")
+    return device
+
+
+# ========================== ДАТАСЕТ ==========================
+
+class PlantDataset(Dataset):
+    """Загрузка изображений из папок (каждая папка = класс)."""
+
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert("RGB")
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+def load_dataset(data_dir):
+    """Сканирование директории, возврат путей, меток и имён классов."""
+    classes = sorted([
+        d for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d))
+    ])
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+
+    paths, labels = [], []
+    valid_ext = {".jpg", ".jpeg", ".png", ".bmp"}
+
+    for cls in classes:
+        cls_dir = os.path.join(data_dir, cls)
+        for fname in os.listdir(cls_dir):
+            if os.path.splitext(fname)[1].lower() in valid_ext:
+                paths.append(os.path.join(cls_dir, fname))
+                labels.append(class_to_idx[cls])
+
+    print(f"Найдено {len(paths)} изображений, {len(classes)} классов")
+    return paths, labels, classes
+
+
+def get_transforms(mode="train", size=224):
+    """Аугментации для train, простая предобработка для val/test."""
+    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+    if mode == "train":
+        return transforms.Compose([
+            transforms.RandomResizedCrop(size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.RandomRotation(25),
+            transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean, std),
         ])
     else:
-        transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+        return transforms.Compose([
+            transforms.Resize(int(size * 1.14)),
+            transforms.CenterCrop(size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean, std),
         ])
-    return transform
 
-def load_data(data_dir, batch_size, img_size, val_split=0.2):
-    """Загружает данные из структуры папок, разделяет на train/val, возвращает DataLoader'ы и список классов."""
-    full_dataset = ImageFolder(
-        root=data_dir,
-        transform=get_transform(img_size, is_train=True)  # временно, для подсчёта размеров; позже заменим
-    )
-    
-    # Определяем размер валидационной выборки
-    val_size = int(val_split * len(full_dataset))
-    train_size = len(full_dataset) - val_size
-    
-    # Разделяем датасет (сохраняем индексы)
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    
-    # Важно: для валидации используем свои трансформации (без аугментации)
-    # Но random_split возвращает Subset, у которого нет атрибута transform.
-    # Поэтому мы создадим отдельные датасеты с нужными трансформациями,
-    # но для этого нужно знать пути к файлам.
-    # Упростим: скопируем датасет с нужными transform, используя классы из полного датасета.
-    
-    # Получаем классы и их индексы
-    class_names = full_dataset.classes
-    
-    # Создаём датасеты с нужными transform
-    train_dataset = ImageFolder(
-        root=data_dir,
-        transform=get_transform(img_size, is_train=True)
-    )
-    val_dataset = ImageFolder(
-        root=data_dir,
-        transform=get_transform(img_size, is_train=False)
-    )
-    
-    # random_split работает некорректно с разными transform, поэтому используем SubsetRandomSampler
-    # Создаём индексы для train/val
-    indices = list(range(len(full_dataset)))
-    np.random.shuffle(indices)
-    train_indices = indices[train_size:]
-    val_indices = indices[:train_size]
-    
-    # Создаём сэмплеры
-    train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
-    val_sampler = torch.utils.data.SubsetRandomSampler(val_indices)
-    
-    # Загружаем данные
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4)
-    
-    return train_loader, val_loader, class_names
 
-def create_model(num_classes, pretrained=True):
-    """Создаёт модель ResNet18 с заменой последнего fully connected слоя."""
-    model = models.resnet18(pretrained=pretrained)
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
+def create_loaders(data_dir, batch_size=32, seed=42):
+    """Создание train/val/test загрузчиков (80/10/10 стратифицированно)."""
+    paths, labels, classes = load_dataset(data_dir)
+
+    # train 80% / temp 20%
+    train_p, temp_p, train_l, temp_l = train_test_split(
+        paths, labels, test_size=0.2, stratify=labels, random_state=seed
+    )
+    # val 50% temp / test 50% temp → по 10% от общего
+    val_p, test_p, val_l, test_l = train_test_split(
+        temp_p, temp_l, test_size=0.5, stratify=temp_l, random_state=seed
+    )
+
+    print(f"Train: {len(train_p)}, Val: {len(val_p)}, Test: {len(test_p)}")
+
+    train_ds = PlantDataset(train_p, train_l, get_transforms("train"))
+    val_ds = PlantDataset(val_p, val_l, get_transforms("val"))
+    test_ds = PlantDataset(test_p, test_l, get_transforms("val"))
+
+    kw = dict(num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size, shuffle=True, drop_last=True, **kw)
+    val_loader = DataLoader(val_ds, batch_size, shuffle=False, **kw)
+    test_loader = DataLoader(test_ds, batch_size, shuffle=False, **kw)
+
+    return train_loader, val_loader, test_loader, classes
+
+
+# ========================== МОДЕЛЬ ==========================
+
+def create_model(num_classes, model_name="efficientnet_b0"):
+    """
+    Создание модели с pretrained backbone и новым классификатором.
+    Поддерживает: efficientnet_b0, resnet50.
+    """
+    if model_name == "efficientnet_b0":
+        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        in_features = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes),
+        )
+    elif model_name == "resnet50":
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        in_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes),
+        )
+    else:
+        raise ValueError(f"Неизвестная модель: {model_name}")
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Модель: {model_name}, параметров: {total / 1e6:.1f}M")
     return model
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device):
+
+def freeze_backbone(model, model_name="efficientnet_b0"):
+    """Заморозить backbone (только classifier обучается)."""
+    if model_name == "efficientnet_b0":
+        for param in model.features.parameters():
+            param.requires_grad = False
+    elif model_name == "resnet50":
+        for name, param in model.named_parameters():
+            if "fc" not in name:
+                param.requires_grad = False
+
+
+def unfreeze_backbone(model):
+    """Разморозить все параметры."""
+    for param in model.parameters():
+        param.requires_grad = True
+
+
+# ========================== ОБУЧЕНИЕ ==========================
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
+    """Одна эпоха обучения."""
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    
-    for inputs, labels in train_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
-        
+    total_loss, correct, total = 0, 0, 0
+
+    for images, labels in tqdm(loader, desc="  Train", leave=False):
+        images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item() * inputs.size(0)
-        _, predicted = torch.max(outputs, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-    
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-    return epoch_loss, epoch_acc
 
-def validate(model, val_loader, criterion, device):
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
+        if scaler:
+            with torch.amp.autocast("cuda"):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
             loss = criterion(outputs, labels)
-            
-            running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-    return epoch_loss, epoch_acc, all_preds, all_labels
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-def plot_confusion_matrix(cm, class_names, save_path='confusion_matrix.png'):
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
-    plt.title('Confusion Matrix')
+        total_loss += loss.item() * images.size(0)
+        correct += (outputs.argmax(1) == labels).sum().item()
+        total += labels.size(0)
+
+    return total_loss / total, 100.0 * correct / total
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device):
+    """Валидация модели."""
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+
+    for images, labels in tqdm(loader, desc="  Val", leave=False):
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        total_loss += loss.item() * images.size(0)
+        correct += (outputs.argmax(1) == labels).sum().item()
+        total += labels.size(0)
+
+    return total_loss / total, 100.0 * correct / total
+
+
+def plot_curves(history, save_path):
+    """Сохранение графиков loss и accuracy."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    ax1.plot(epochs, history["train_loss"], "b-o", label="Train", ms=4)
+    ax1.plot(epochs, history["val_loss"], "r-o", label="Val", ms=4)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Loss", fontweight="bold")
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+
+    ax2.plot(epochs, history["train_acc"], "b-o", label="Train", ms=4)
+    ax2.plot(epochs, history["val_acc"], "r-o", label="Val", ms=4)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy (%)")
+    ax2.set_title("Accuracy", fontweight="bold")
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(save_path)
-    plt.show()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Графики сохранены: {save_path}")
 
-def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Загрузка данных
-    train_loader, val_loader, class_names = load_data(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        img_size=args.img_size,
-        val_split=args.val_split
+
+def train(args):
+    """Полный цикл обучения."""
+    set_seed(args.seed)
+    device = get_device()
+    os.makedirs("results", exist_ok=True)
+
+    # Данные
+    train_loader, val_loader, test_loader, classes = create_loaders(
+        args.data_dir, args.batch_size, args.seed
     )
-    print(f"Classes: {class_names}")
-    print(f"Train samples: {len(train_loader.sampler)}, Val samples: {len(val_loader.sampler)}")
-    
+    num_classes = len(classes)
+
     # Модель
-    model = create_model(num_classes=len(class_names), pretrained=True)
-    model = model.to(device)
-    
-    # Функция потерь и оптимизатор
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    
+    model = create_model(num_classes, args.model).to(device)
+
+    # Заморозка backbone на первые 3 эпохи
+    freeze_epochs = 3
+    freeze_backbone(model, args.model)
+    print(f"Backbone заморожен на {freeze_epochs} эпох")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # Оптимизатор с разными lr для backbone и classifier
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
+
+    # Mixed precision
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+
     # Обучение
-    best_val_acc = 0.0
-    best_model_state = None
-    
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_val_acc = 0
+    patience, patience_counter = 5, 0
+
+    print(f"\n{'='*60}")
+    print(f"Обучение: {args.epochs} эпох, batch={args.batch_size}, lr={args.lr}")
+    print(f"{'='*60}")
+
     for epoch in range(args.epochs):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion, device)
+        # Разморозка после freeze_epochs
+        if epoch == freeze_epochs:
+            unfreeze_backbone(model)
+            # Обновляем lr: backbone медленнее
+            optimizer = optim.AdamW([
+                {"params": [p for n, p in model.named_parameters()
+                            if "classifier" not in n and "fc" not in n],
+                 "lr": args.lr * 0.1},
+                {"params": [p for n, p in model.named_parameters()
+                            if "classifier" in n or "fc" in n],
+                 "lr": args.lr},
+            ], weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=args.epochs - freeze_epochs, eta_min=1e-7
+            )
+            print("  → Backbone разморожен, fine-tuning")
+
+        t0 = time.time()
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler
+        )
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
         scheduler.step()
-        
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        
+        dt = time.time() - t0
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        lr_now = optimizer.param_groups[-1]["lr"]
+        print(
+            f"Epoch {epoch+1:2d}/{args.epochs} ({dt:.0f}s) | "
+            f"Train: loss={train_loss:.4f} acc={train_acc:.1f}% | "
+            f"Val: loss={val_loss:.4f} acc={val_acc:.1f}% | lr={lr_now:.2e}"
+        )
+
+        # Сохранение лучшей модели
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_model_state = model.state_dict().copy()
-            torch.save(best_model_state, 'best_model.pth')
-            print(f"Saved best model with val_acc={best_val_acc:.4f}")
-    
-    # Загрузка лучшей модели
-    model.load_state_dict(best_model_state)
-    
-    # Финальная оценка на валидации
-    val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion, device)
-    
-    # Метрики
-    accuracy = accuracy_score(val_labels, val_preds)
-    f1 = f1_score(val_labels, val_preds, average='weighted')
-    cm = confusion_matrix(val_labels, val_preds)
-    report = classification_report(val_labels, val_preds, target_names=class_names)
-    
-    print("\n===== Final Report =====")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"F1-score (weighted): {f1:.4f}")
-    print("Confusion Matrix:")
-    print(cm)
-    print("\nClassification Report:")
-    print(report)
-    
-    # Сохранение матрицы ошибок
-    plot_confusion_matrix(cm, class_names, save_path='confusion_matrix.png')
-    print("Confusion matrix saved as 'confusion_matrix.png'")
+            patience_counter = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "class_names": classes,
+                "num_classes": num_classes,
+                "model_name": args.model,
+                "val_acc": val_acc,
+                "epoch": epoch,
+            }, "results/best_model.pth")
+            print(f"  ✓ Лучшая модель сохранена (acc={val_acc:.1f}%)")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping (patience={patience})")
+                break
+
+    print(f"\nЛучшая Val Accuracy: {best_val_acc:.2f}%")
+
+    # Графики
+    plot_curves(history, "results/training_curves.png")
+
+    # Сохранение истории
+    with open("results/training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Plant Disease Classification using CNN')
-    parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR, help='Path to dataset folder')
-    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=DEFAULT_LR, help='Learning rate')
-    parser.add_argument('--img_size', type=int, default=DEFAULT_IMG_SIZE, help='Input image size')
-    parser.add_argument('--val_split', type=float, default=0.2, help='Validation split ratio')
+    parser = argparse.ArgumentParser(description="Обучение классификатора растений")
+    parser.add_argument("--data_dir", type=str, default="data/PlantVillage")
+    parser.add_argument("--model", type=str, default="efficientnet_b0",
+                        choices=["efficientnet_b0", "resnet50"])
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    
-    main(args)
+    train(args)
