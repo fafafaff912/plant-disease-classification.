@@ -1,16 +1,13 @@
-# Игнорируем папку с данными
-data/
-# Игнорируем временные файлы Python
 __pycache__/
-*.pyc
-# Игнорируем чекпоинты моделей
-*.pth
-*.pt
-# Игнорируем виртуальное окружение (если оно в папке проекта)
+*.py[cod]
 venv/
 env/
-# Игнорируем файлы Jupyter checkpoint
+data/
+*.pth
+*.pt
 .ipynb_checkpoints/
-# Игнорируем системные файлы
+.idea/
+.vscode/
 .DS_Store
-Thumbs.db
+runs/
+*.log
